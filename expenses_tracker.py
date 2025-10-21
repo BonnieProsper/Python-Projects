@@ -5,11 +5,10 @@ from typing import Dict, List, Any
 
 DATA_FILE = "expenses.json"
 
-
 # ---------- DATA HANDLING ----------
 
 def load_data() -> List[Dict[str, Any]]:
-    """Load expenses from JSON file."""
+    # Load expenses from JSON file. 
     if not os.path.exists(DATA_FILE):
         return []
     try:
@@ -20,7 +19,7 @@ def load_data() -> List[Dict[str, Any]]:
 
 
 def save_data(expenses: List[Dict[str, Any]]) -> None:
-    """Save expenses to JSON file."""
+    # Save expenses to JSON file.
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(expenses, f, indent=4, ensure_ascii=False)
 
@@ -28,7 +27,7 @@ def save_data(expenses: List[Dict[str, Any]]) -> None:
 # ---------- CORE LOGIC ----------
 
 def add_expense(expenses: List[Dict[str, Any]]) -> None:
-    """Add a new expense entry."""
+    # Add a new expense entry.
     try:
         amount = float(input("Enter amount: $"))
         category = input("Enter category (e.g., food, transport): ").strip().lower()
@@ -49,7 +48,7 @@ def add_expense(expenses: List[Dict[str, Any]]) -> None:
 
 
 def view_expenses(expenses: List[Dict[str, Any]]) -> None:
-    """Display all expenses sorted by date."""
+    # Display all expenses sorted by date.
     if not expenses:
         print("No expenses recorded yet.\n")
         return
@@ -63,7 +62,7 @@ def view_expenses(expenses: List[Dict[str, Any]]) -> None:
 
 
 def delete_expense(expenses: List[Dict[str, Any]]) -> None:
-    """Delete an expense by index."""
+    # Delete an expense by index.
     view_expenses(expenses)
     if not expenses:
         return
@@ -80,7 +79,7 @@ def delete_expense(expenses: List[Dict[str, Any]]) -> None:
 
 
 def summarize_by_category(expenses: List[Dict[str, Any]]) -> None:
-    """Show total spent per category."""
+    # Show total spent per category.
     if not expenses:
         print("No data available.\n")
         return
@@ -97,7 +96,7 @@ def summarize_by_category(expenses: List[Dict[str, Any]]) -> None:
 
 
 def summarize_by_month(expenses: List[Dict[str, Any]]) -> None:
-    """Show total spent per month."""
+    # Show total spent per month.
     if not expenses:
         print("No data available.\n")
         return
