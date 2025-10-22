@@ -1,0 +1,3 @@
+notes/ 
+*.pyc 
+__pycache__/ 
