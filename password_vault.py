@@ -2,7 +2,6 @@
 ==========================================================
  PASSWORD VAULT CLI
  Securely store, view, and manage encrypted credentials.
- Author: Bonnie (2025)
 ==========================================================
 """
 
