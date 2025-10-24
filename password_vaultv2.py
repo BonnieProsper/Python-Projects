@@ -1,7 +1,6 @@
 """
 ==========================================================
  PASSWORD VAULT CLI (PURE PYTHON VERSION)
- Author: Bonnie (2025)
 ----------------------------------------------------------
  Stores and retrieves passwords using a custom cipher.
  Demonstrates logic, modular design, and file handling
@@ -15,7 +14,6 @@ from getpass import getpass
 
 VAULT_FILE = "vault_pure.json"
 
-
 # ==========================================================
 # Encryption Utilities
 # ==========================================================
@@ -25,7 +23,6 @@ def generate_shift(master_password):
     The shift is derived from the sum of character codes.
     """
     return sum(ord(ch) for ch in master_password) % 26  # value 0–25
-
 
 def encrypt_text(text, shift):
     """
@@ -58,7 +55,6 @@ def decrypt_text(text, shift):
         else:
             decrypted.append(chr((ord(ch) - shift) % 126))
     return ''.join(decrypted)
-
 
 # ==========================================================
 # Core Vault Class
@@ -135,7 +131,6 @@ class PasswordVault:
         else:
             print("[!] No matches found.")
 
-
 # ==========================================================
 # Password Strength Checker
 # ==========================================================
@@ -158,7 +153,6 @@ def check_password_strength(password):
         return "Moderate"
     else:
         return "Weak"
-
 
 # ==========================================================
 # CLI Interface
@@ -209,7 +203,6 @@ def main_menu(vault):
 
         else:
             print("[!] Invalid choice. Try again.")
-
 
 # ==========================================================
 # Entry Point
