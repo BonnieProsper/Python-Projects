@@ -1,6 +1,6 @@
 """
 ==========================================================
- PASSWORD VAULT CLI (PURE PYTHON VERSION)
+ PASSWORD VAULT CLI (WITHOUT USING UNNEEDED LIBRARIES)
 ----------------------------------------------------------
  Stores and retrieves passwords using a custom cipher.
  Demonstrates logic, modular design, and file handling
