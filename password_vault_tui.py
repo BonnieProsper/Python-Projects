@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 Password Vault TUI (pure Python, standard library only)
-Author: Bonnie (2025)
 Description:
   - PBKDF2-derived key (master password) used to encrypt data via XOR stream
   - JSON-backed vault with metadata, entries, history, and tags
