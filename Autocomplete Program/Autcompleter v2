@@ -1,0 +1,711 @@
+#!/usr/bin/env python3
+"""
+Smart Adaptive Autocomplete — v2 
+
+Enhancements over the basic version:
+ - Context-aware next-word prediction using a bigram model
+ - Typo-tolerance using BK-tree + Levenshtein distance
+ - Hybrid ranking combining frequency, recency, context, and edit-distance penalty
+ - Persistent storage of words + bigrams
+ - Improved CLI with context commands and fuzzy mode
+
+Notes:
+ - improve this using integrated libraries and ML
+
+"""
+
+from __future__ import annotations
+import json
+import os
+import time
+import heapq
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional, Iterable
+
+# ---------------------------
+# Config / File paths
+# ---------------------------
+DATA_FILE = Path("autocomplete_v2_data.json")
+DEFAULT_SUGGESTIONS = 8
+RECENCY_CONSTANT = 3600.0  # seconds (1 hour) used in recency boost
+EDIT_DISTANCE_WEIGHT = 1.5  # penalty multiplier for edit distance
+CONTEXT_BOOST_WEIGHT = 2.0  # multiplier applied when context suggests a word
+
+
+# ---------------------------
+# Utilities
+# ---------------------------
+def now_ts() -> float:
+    return time.time()
+
+
+def safe_lower(s: str) -> str:
+    return s.strip().lower()
+
+
+# ---------------------------
+# Levenshtein distance
+# ---------------------------
+def levenshtein(a: str, b: str) -> int:
+    """
+    Compute the Levenshtein edit distance between strings a and b.
+    Classic dynamic programming implementation — O(len(a)*len(b)).
+    """
+    if a == b:
+        return 0
+    la, lb = len(a), len(b)
+    if la == 0:
+        return lb
+    if lb == 0:
+        return la
+    # use two-row DP to save memory
+    prev = list(range(lb + 1))
+    curr = [0] * (lb + 1)
+    for i, ca in enumerate(a, start=1):
+        curr[0] = i
+        for j, cb in enumerate(b, start=1):
+            cost = 0 if ca == cb else 1
+            curr[j] = min(prev[j] + 1,       # deletion
+                          curr[j - 1] + 1,   # insertion
+                          prev[j - 1] + cost) # substitution
+        prev, curr = curr, prev
+    return prev[lb]
+
+
+# ---------------------------
+# BK-tree for fuzzy search
+# ---------------------------
+class BKNode:
+    """Node in a BK-tree storing a single word and a mapping distance->child."""
+    __slots__ = ("word", "children")
+
+    def __init__(self, word: str):
+        self.word = word
+        self.children: Dict[int, BKNode] = {}
+
+    def insert(self, word: str) -> None:
+        d = levenshtein(word, self.word)
+        child = self.children.get(d)
+        if child:
+            child.insert(word)
+        else:
+            self.children[d] = BKNode(word)
+
+    def search(self, target: str, max_dist: int) -> List[Tuple[str, int]]:
+        """Return (word, dist) within max_dist of target."""
+        results: List[Tuple[str, int]] = []
+        dist = levenshtein(self.word, target)
+        if dist <= max_dist:
+            results.append((self.word, dist))
+        # children keys are distances from this.word to child.word
+        for edge_dist, child in self.children.items():
+            if dist - max_dist <= edge_dist <= dist + max_dist:
+                results.extend(child.search(target, max_dist))
+        return results
+
+
+class BKTree:
+    """Simple wrapper for BK-tree root; supports build and fuzzy-query."""
+    def __init__(self):
+        self.root: Optional[BKNode] = None
+
+    def build(self, words: Iterable[str]) -> None:
+        it = iter(words)
+        try:
+            first = next(it)
+        except StopIteration:
+            self.root = None
+            return
+        self.root = BKNode(first)
+        for w in it:
+            self.root.insert(w)
+
+    def query(self, target: str, max_dist: int) -> List[Tuple[str, int]]:
+        if not self.root:
+            return []
+        return self.root.search(target, max_dist)
+
+
+# ---------------------------
+# Trie (vocabulary + metadata)
+# ---------------------------
+class TrieNode:
+    __slots__ = ("children", "is_word", "freq", "last_used")
+
+    def __init__(self):
+        self.children: Dict[str, TrieNode] = {}
+        self.is_word: bool = False
+        self.freq: int = 0
+        self.last_used: float = 0.0
+
+
+class Trie:
+    """Trie storing words and per-word metadata (freq + last_used)."""
+
+    def __init__(self):
+        self.root = TrieNode()
+
+    def insert(self, word: str, freq: int = 1, last_used: Optional[float] = None) -> None:
+        node = self.root
+        for ch in word:
+            node = node.children.setdefault(ch, TrieNode())
+        if not node.is_word:
+            node.is_word = True
+            node.freq = 0
+            node.last_used = 0.0
+        node.freq += freq
+        node.last_used = last_used if last_used is not None else now_ts()
+
+    def contains(self, word: str) -> bool:
+        node = self._find(word)
+        return bool(node and node.is_word)
+
+    def _find(self, prefix: str) -> Optional[TrieNode]:
+        node = self.root
+        for ch in prefix:
+            node = node.children.get(ch)
+            if node is None:
+                return None
+        return node
+
+    def iter_words_from(self, prefix: str) -> List[Tuple[str, TrieNode]]:
+        """Return all (word, node) under prefix using iterative DFS."""
+        start = self._find(prefix)
+        if not start:
+            return []
+        out: List[Tuple[str, TrieNode]] = []
+        stack: List[Tuple[str, TrieNode]] = [(prefix, start)]
+        while stack:
+            w, n = stack.pop()
+            if n.is_word:
+                out.append((w, n))
+            for ch, child in n.children.items():
+                stack.append((w + ch, child))
+        return out
+
+    def words_count(self) -> int:
+        return len(self.iter_words_from(""))
+
+    def remove(self, word: str) -> bool:
+        path: List[Tuple[str, TrieNode]] = []
+        node = self.root
+        for ch in word:
+            if ch not in node.children:
+                return False
+            path.append((ch, node))
+            node = node.children[ch]
+        if not node.is_word:
+            return False
+        node.is_word = False
+        node.freq = 0
+        node.last_used = 0.0
+        for ch, parent in reversed(path):
+            child = parent.children[ch]
+            if child.children or child.is_word:
+                break
+            del parent.children[ch]
+        return True
+
+
+# ---------------------------
+# Context model (simple bigram frequencies)
+# ---------------------------
+class BigramModel:
+    """
+    Stores counts of (prev_word -> next_word -> count).
+    Allows a context-based boost for suggestions given a previous word.
+    """
+
+    def __init__(self):
+        self.data: Dict[str, Dict[str, int]] = {}
+
+    def add_pair(self, prev: str, nxt: str, count: int = 1) -> None:
+        prev = prev.lower()
+        nxt = nxt.lower()
+        self.data.setdefault(prev, {})
+        self.data[prev][nxt] = self.data[prev].get(nxt, 0) + count
+
+    def top_next(self, prev: str, limit: int = 5) -> List[Tuple[str, int]]:
+        prev = prev.lower()
+        nxts = self.data.get(prev, {})
+        if not nxts:
+            return []
+        return sorted(nxts.items(), key=lambda kv: -kv[1])[:limit]
+
+    def merge_from_pairs(self, pairs: Iterable[Tuple[str, str, int]]) -> None:
+        for p, n, c in pairs:
+            self.add_pair(p, n, c)
+
+
+# ---------------------------
+# Scoring & suggestion engine
+# ---------------------------
+@dataclass
+class Candidate:
+    word: str
+    score: float
+    freq: int
+    last_used: float
+    edit_dist: int
+    context_boost: float
+
+
+class SmartAutocomplete:
+    """
+    Combines Trie, BigramModel, and BK-tree to produce ranked suggestions.
+    Ranking formula (explainable):
+      base = freq + recency_boost
+      penalty = edit_dist * EDIT_DISTANCE_WEIGHT
+      context_boost = CONTEXT_BOOST_WEIGHT * (bigram_count_norm)
+      score = base + context_boost - penalty
+    """
+
+    def __init__(self, trie: Trie, bigram: BigramModel, bk_tree: BKTree):
+        self.trie = trie
+        self.bigram = bigram
+        self.bk_tree = bk_tree
+        self.recency_constant = RECENCY_CONSTANT
+
+    def _recency_boost(self, last_used: float) -> float:
+        if last_used <= 0:
+            return 0.0
+        elapsed = now_ts() - last_used
+        return max(0.0, self.recency_constant / (elapsed + 1.0))
+
+    def _context_boost(self, prev: Optional[str], candidate: str) -> float:
+        if not prev:
+            return 0.0
+        prev = prev.lower()
+        followers = self.bigram.data.get(prev)
+        if not followers:
+            return 0.0
+        # normalized count between 0 and 1
+        count = followers.get(candidate.lower(), 0)
+        if count <= 0:
+            return 0.0
+        max_count = max(followers.values())
+        norm = count / max_count if max_count > 0 else 0.0
+        return CONTEXT_BOOST_WEIGHT * norm
+
+    def _score_candidate(self, node: TrieNode, edit_dist: int, prev_context: Optional[str]) -> float:
+        base = node.freq + self._recency_boost(node.last_used)
+        penalty = edit_dist * EDIT_DISTANCE_WEIGHT
+        context = self._context_boost(prev_context, node and node_word(node))
+        return base + context - penalty
+
+    def suggest(self, prefix: str, limit: int = DEFAULT_SUGGESTIONS,
+                prev_context: Optional[str] = None, fuzzy: bool = False,
+                max_edit_distance: int = 2) -> List[Candidate]:
+        """
+        Return up to `limit` Candidate objects for the prefix.
+          - If fuzzy=True, include close matches from BK-tree up to max_edit_distance.
+          - If fuzzy=False, only suggest exact-prefix matches.
+          - prev_context optionally boosts candidates that commonly follow prev_context.
+        """
+        prefix = safe_lower(prefix)
+        candidates_map: Dict[str, Candidate] = {}
+
+        # 1) Exact prefix matches from trie
+        for word, node in self.trie.iter_words_from(prefix):
+            edit_dist = 0 if word == prefix else 0  # prefix match considered exact for autocompletion
+            score = node.freq + self._recency_boost(node.last_used) + self._context_boost(prev_context, word)
+            candidates_map[word] = Candidate(word=word, score=score, freq=node.freq,
+                                             last_used=node.last_used, edit_dist=edit_dist,
+                                             context_boost=self._context_boost(prev_context, word))
+
+        # 2) Fuzzy matches: use BK-tree to find words within edit distance
+        if fuzzy and self.bk_tree.root:
+            # query BK-tree using the raw prefix as target for fuzzy matches
+            bk_results = self.bk_tree.query(prefix, max_edit_distance)
+            for w, dist in bk_results:
+                # avoid duplicates: if we already have the exact prefix match, skip or adjust
+                node = self.trie._find(w)
+                if node is None or not node.is_word:
+                    continue
+                # compute combined score
+                base = node.freq + self._recency_boost(node.last_used)
+                penalty = dist * EDIT_DISTANCE_WEIGHT
+                context = self._context_boost(prev_context, w)
+                score = base + context - penalty
+                # If the word already present as prefix candidate, take the higher score
+                existing = candidates_map.get(w)
+                if existing:
+                    existing.score = max(existing.score, score)
+                    existing.edit_dist = min(existing.edit_dist, dist)
+                else:
+                    candidates_map[w] = Candidate(word=w, score=score, freq=node.freq,
+                                                  last_used=node.last_used, edit_dist=dist,
+                                                  context_boost=context)
+
+        # 3) Score and return top-k using heap for efficiency
+        heap: List[Tuple[float, Candidate]] = []
+        for cand in candidates_map.values():
+            heapq.heappush(heap, (-cand.score, cand))
+        top: List[Candidate] = []
+        for _ in range(min(limit, len(heap))):
+            _, c = heapq.heappop(heap)
+            top.append(c)
+        return top
+
+
+# helper to retrieve node word? Avoid storing pointer back to word in node; we get word from iter outputs
+# but SmartAutocomplete._score_candidate used node_word: simplify by not calling that function.
+def node_word(node: TrieNode) -> str:
+    # placeholder; shouldn't be used in current design
+    return ""
+
+
+# ---------------------------
+# Persistence (v2: words + bigrams)
+# ---------------------------
+class PersistenceV2:
+    """
+    Storage format:
+    {
+      "words": [{"word": w, "freq": f, "last_used": t}, ...],
+      "bigrams": [{"prev": p, "next": n, "count": c}, ...],
+      "generated_at": ts
+    }
+    """
+
+    def __init__(self, path: Path = DATA_FILE):
+        self.path = Path(path)
+
+    def save(self, trie: Trie, bigram: BigramModel) -> None:
+        words = []
+        for w, node in trie.iter_words_from(""):
+            words.append({"word": w, "freq": node.freq, "last_used": node.last_used})
+        bigr = []
+        for prev, followers in bigram.data.items():
+            for nxt, cnt in followers.items():
+                bigr.append({"prev": prev, "next": nxt, "count": cnt})
+        data = {"words": words, "bigrams": bigr, "generated_at": now_ts()}
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+
+    def load(self) -> Tuple[Trie, BigramModel]:
+        trie = Trie()
+        bigram = BigramModel()
+        if not self.path.exists():
+            return trie, bigram
+        try:
+            with self.path.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            for item in data.get("words", []):
+                w = item.get("word")
+                if not w:
+                    continue
+                trie.insert(safe_lower(w), freq=int(item.get("freq", 1)), last_used=float(item.get("last_used", 0.0)))
+            for b in data.get("bigrams", []):
+                prev = b.get("prev")
+                nxt = b.get("next")
+                cnt = int(b.get("count", 1))
+                if prev and nxt:
+                    bigram.add_pair(prev, nxt, cnt)
+        except Exception:
+            # if anything goes wrong, return empty models rather than crash
+            return Trie(), BigramModel()
+        return trie, bigram
+
+
+# ---------------------------
+# CLI (v2)
+# ---------------------------
+HELP_TEXT = """
+Commands:
+  :add <word>               - Add a word manually (or use when none suggestions).
+  :remove <word>            - Remove a word from the dataset.
+  :context <word|clear>     - Set or clear previous-word context for predictions.
+  :fuzzy on|off             - Toggle fuzzy matching by default.
+  :suggest <prefix>         - Explicitly request suggestions for a prefix.
+  :stats                    - Show dataset statistics.
+  :export <path>            - Export word+bigram dataset (JSON).
+  :import <path>            - Import exported JSON; merges counts.
+  :visualize                - Print a shallow trie visualization.
+  :help                     - Show this help text.
+  :quit                     - Save and exit.
+Notes:
+  - After seeing suggestions, type its number to accept (increments freq).
+  - Typing a full word adds/accepts it; when in context mode, adding a word also records the bigram.
+"""
+
+class CLIv2:
+    """Interactive CLI integrating SmartAutocomplete, persistence, BK-tree, and bigrams."""
+
+    def __init__(self, persistence: PersistenceV2):
+        self.persistence = persistence
+        self.trie, self.bigram = self.persistence.load()
+        self.bk_tree = BKTree()
+        self._rebuild_bk_tree()
+        self.engine = SmartAutocomplete(self.trie, self.bigram, self.bk_tree)
+        self.prev_context: Optional[str] = None
+        self.fuzzy_enabled: bool = False
+
+    def _rebuild_bk_tree(self) -> None:
+        words = [w for w, _ in self.trie.iter_words_from("")]
+        self.bk_tree = BKTree()
+        self.bk_tree.build(words)
+
+    def run(self) -> None:
+        print("Smart Adaptive Autocomplete v2 (context-aware + fuzzy)")
+        print("Type a prefix and press Enter. Use :help for commands.\n")
+        try:
+            while True:
+                inp = input("prefix> ").strip()
+                if not inp:
+                    continue
+                if inp.startswith(":"):
+                    self._handle_command(inp)
+                    continue
+                self._handle_query(inp)
+        except (KeyboardInterrupt, EOFError):
+            print("\nExiting — saving.")
+            self._save_and_exit()
+
+    def _handle_query(self, text: str) -> None:
+        prefix = safe_lower(text)
+        suggestions = self.engine.suggest(prefix, limit=DEFAULT_SUGGESTIONS,
+                                          prev_context=self.prev_context, fuzzy=self.fuzzy_enabled)
+        if suggestions:
+            self._present_suggestions(prefix, suggestions)
+            return
+        # if nothing found and fuzzy disabled, try fuzzy fallback automatically (gentle UX)
+        if not self.fuzzy_enabled:
+            fuzzy_try = self.engine.suggest(prefix, limit=DEFAULT_SUGGESTIONS,
+                                            prev_context=self.prev_context, fuzzy=True, max_edit_distance=2)
+            if fuzzy_try:
+                print("(No exact prefix matches — showing fuzzy matches)")
+                self._present_suggestions(prefix, fuzzy_try)
+                return
+        # nothing found at all: interactive learning
+        print("No suggestions.")
+        if self._ask_yes_no(f"Add '{prefix}' to vocabulary?"):
+            self.trie.insert(prefix, freq=1, last_used=now_ts())
+            if self.prev_context:
+                self.bigram.add_pair(self.prev_context, prefix, count=1)
+            self._rebuild_bk_tree()
+            print(f"Added '{prefix}'.")
+            self.persistence.save(self.trie, self.bigram)
+
+    def _present_suggestions(self, prefix: str, suggestions: List[Candidate]) -> None:
+        print("\nSuggestions:")
+        for i, cand in enumerate(suggestions, start=1):
+            edit_info = f", edit={cand.edit_dist}" if cand.edit_dist > 0 else ""
+            ctx_info = f", ctx_boost={cand.context_boost:.2f}" if cand.context_boost > 0 else ""
+            print(f"  {i}. {cand.word} (score={cand.score:.2f}, freq={cand.freq}{edit_info}{ctx_info})")
+        print("  0. [type full word or new word to add]")
+        choice = input("Choose [number / word / nothing]: ").strip()
+        if not choice:
+            return
+        if choice.isdigit():
+            idx = int(choice)
+            if idx == 0:
+                return
+            if 1 <= idx <= len(suggestions):
+                chosen = suggestions[idx - 1]
+                self._accept_word(chosen.word)
+                return
+            print("Invalid number.")
+            return
+        # typed word selection or addition
+        typed = safe_lower(choice)
+        # if typed matches a suggestion exactly, accept it
+        for s in suggestions:
+            if typed == s.word:
+                self._accept_word(typed)
+                return
+        # otherwise add typed word actively
+        self.trie.insert(typed, freq=1, last_used=now_ts())
+        if self.prev_context:
+            self.bigram.add_pair(self.prev_context, typed, count=1)
+        self._rebuild_bk_tree()
+        self.persistence.save(self.trie, self.bigram)
+        print(f"Added '{typed}' to vocabulary.")
+
+    def _accept_word(self, word: str) -> None:
+        node = self.trie._find(word)
+        if node is None or not node.is_word:
+            # safety: if word mysteriously absent, insert
+            self.trie.insert(word, freq=1, last_used=now_ts())
+            node = self.trie._find(word)
+        # increment frequency and update last_used
+        node.freq += 1
+        node.last_used = now_ts()
+        # record bigram if in context mode
+        if self.prev_context:
+            self.bigram.add_pair(self.prev_context, word, count=1)
+        self._rebuild_bk_tree()
+        self.persistence.save(self.trie, self.bigram)
+        print(f"Accepted '{word}'. (freq now {node.freq})")
+
+    def _handle_command(self, line: str) -> None:
+        parts = line.split(maxsplit=1)
+        cmd = parts[0].lower()
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        if cmd == ":help":
+            print(HELP_TEXT)
+        elif cmd == ":add":
+            if not arg:
+                print("Usage: :add <word>")
+                return
+            w = safe_lower(arg)
+            self.trie.insert(w, freq=1, last_used=now_ts())
+            self._rebuild_bk_tree()
+            self.persistence.save(self.trie, self.bigram)
+            print(f"Added '{w}'")
+        elif cmd == ":remove":
+            if not arg:
+                print("Usage: :remove <word>")
+                return
+            ok = self.trie.remove(safe_lower(arg))
+            if ok:
+                self._rebuild_bk_tree()
+                self.persistence.save(self.trie, self.bigram)
+                print(f"Removed '{arg}'")
+            else:
+                print("Word not found.")
+        elif cmd == ":context":
+            if not arg:
+                print("Usage: :context <word|clear>")
+                return
+            if arg.lower() == "clear":
+                self.prev_context = None
+                print("Context cleared.")
+            else:
+                self.prev_context = safe_lower(arg)
+                print(f"Context set to '{self.prev_context}'")
+        elif cmd == ":fuzzy":
+            if arg.lower() in ("on", "true", "1"):
+                self.fuzzy_enabled = True
+                print("Fuzzy mode enabled.")
+            elif arg.lower() in ("off", "false", "0"):
+                self.fuzzy_enabled = False
+                print("Fuzzy mode disabled.")
+            else:
+                print("Usage: :fuzzy on|off")
+        elif cmd == ":suggest":
+            if not arg:
+                print("Usage: :suggest <prefix>")
+                return
+            s = self.engine.suggest(safe_lower(arg), prev_context=self.prev_context, fuzzy=self.fuzzy_enabled)
+            if not s:
+                print("No suggestions.")
+            else:
+                for i, c in enumerate(s, 1):
+                    print(f"{i}. {c.word} (score {c.score:.2f})")
+        elif cmd == ":stats":
+            total = self.trie.words_count()
+            print(f"Vocabulary size: {total} words")
+            # top frequency words
+            all_words = self.trie.iter_words_from("")
+            top = sorted(((w, n.freq) for w, n in all_words), key=lambda kv: -kv[1])[:10]
+            if top:
+                print("Top words by frequency:")
+                for w, f in top:
+                    print(f"  {w} — {f}")
+        elif cmd == ":export":
+            path = arg or "autocomplete_export_v2.json"
+            self._export(path)
+        elif cmd == ":import":
+            if not arg:
+                print("Usage: :import <path>")
+                return
+            self._import(arg)
+        elif cmd == ":visualize":
+            visualize_trie(self.trie)
+        elif cmd == ":quit":
+            self._save_and_exit()
+        else:
+            print("Unknown command. Use :help for available commands.")
+
+    def _export(self, path: str) -> None:
+        data = {"words": [], "bigrams": []}
+        for w, n in self.trie.iter_words_from(""):
+            data["words"].append({"word": w, "freq": n.freq, "last_used": n.last_used})
+        for prev, followers in self.bigram.data.items():
+            for nxt, cnt in followers.items():
+                data["bigrams"].append({"prev": prev, "next": nxt, "count": cnt})
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False, indent=2)
+            print(f"Exported to {path}")
+        except Exception as e:
+            print("Export failed:", e)
+
+    def _import(self, path: str) -> None:
+        if not os.path.exists(path):
+            print("File not found:", path)
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            cnt = 0
+            for item in data.get("words", []):
+                w = item.get("word")
+                if not w:
+                    continue
+                f = int(item.get("freq", 1))
+                lu = float(item.get("last_used", 0.0))
+                node = self.trie._find(w)
+                if node and node.is_word:
+                    node.freq += f
+                    node.last_used = max(node.last_used, lu)
+                else:
+                    self.trie.insert(w, freq=f, last_used=lu)
+                cnt += 1
+            for b in data.get("bigrams", []):
+                p = b.get("prev")
+                n = b.get("next")
+                c = int(b.get("count", 1))
+                if p and n:
+                    self.bigram.add_pair(p, n, c)
+            self._rebuild_bk_tree()
+            self.persistence.save(self.trie, self.bigram)
+            print(f"Imported {cnt} words and bigrams.")
+        except Exception as e:
+            print("Import failed:", e)
+
+    def _ask_yes_no(self, prompt: str) -> bool:
+        ans = input(f"{prompt} (y/n): ").strip().lower()
+        return ans.startswith("y")
+
+    def _save_and_exit(self) -> None:
+        try:
+            self.persistence.save(self.trie, self.bigram)
+            print("Saved.")
+        except Exception as e:
+            print("Save failed:", e)
+        raise SystemExit(0)
+
+
+# ---------------------------
+# Visualization helper (shallow)
+# ---------------------------
+def visualize_trie(trie: Trie, max_depth: int = 3) -> None:
+    def _print(node: TrieNode, prefix: str, depth: int):
+        if depth > max_depth:
+            return
+        children = sorted(node.children.items(), key=lambda kv: kv[0])
+        for ch, child in children:
+            marker = "*" if child.is_word else ""
+            info = f"{prefix + ch}{marker}"
+            print("  " * depth + info)
+            _print(child, prefix + ch, depth + 1)
+    print("Trie visualization (shallow):")
+    _print(trie.root, "", 0)
+    print("(end visualization)\n")
+
+
+# ---------------------------
+# Entrypoint
+# ---------------------------
+def main():
+    persistence = PersistenceV2(DATA_FILE)
+    cli = CLIv2(persistence)
+    cli.run()
+
+
+if __name__ == "__main__":
+    main()
