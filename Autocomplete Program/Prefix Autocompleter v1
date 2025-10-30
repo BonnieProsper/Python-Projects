@@ -25,7 +25,7 @@ DEFAULT_SUGGESTIONS = 8
 
 # ----- Trie node & storage model -----
 class TrieNode:
-    """A node in the Trie. Children stored in dict; end marker holds metadata."""
+    """A node in the Trie. Children stored in dict, end marker holds metadata."""
     __slots__ = ("children", "is_word", "freq", "last_used")
 
     def __init__(self):
@@ -38,13 +38,13 @@ class TrieNode:
 
 # ----- Trie implementation -----
 class Trie:
-    """Classic Trie with insertion, deletion, and prefix traversal."""
+    """Trie with insertion, deletion, and prefix traversal."""
 
     def __init__(self):
         self.root = TrieNode()
 
     def insert(self, word: str, freq: int = 1, last_used: Optional[float] = None) -> None:
-        """Insert word into trie; set metadata if provided."""
+        """Insert word into trie, set metadata if provided."""
         node = self.root
         for ch in word:
             node = node.children.setdefault(ch, TrieNode())
@@ -53,7 +53,7 @@ class Trie:
         node.last_used = last_used if last_used is not None else time.time()
 
     def set_metadata(self, word: str, freq: int, last_used: float) -> bool:
-        """Set exact metadata for an existing word; returns True if word exists."""
+        """Set exact metadata for an existing word, returns True if word exists."""
         node = self._find_node(word)
         if node and node.is_word:
             node.freq = freq
@@ -66,7 +66,7 @@ class Trie:
         return bool(node and node.is_word)
 
     def remove(self, word: str) -> bool:
-        """Remove a word completely; returns True if removed."""
+        """Remove a word completely, returns True if removed."""
         path: List[Tuple[str, TrieNode]] = []
         node = self.root
         for ch in word:
@@ -130,7 +130,7 @@ class Autocomplete:
         self.recency_constant = 3600.0  # one hour; tuneable
 
     def score(self, node: TrieNode) -> float:
-        """Compute a score for a node (explained in docstring)."""
+        """Compute a score for a node."""
         now = time.time()
         recency = 0.0
         if node.last_used > 0:
@@ -198,7 +198,7 @@ class Persistence:
         return trie
 
 
-# ----- Small ASCII visualization (for debugging / portfolio demo) -----
+# ----- Small ASCII visualization (for debugging / demo) -----
 def visualize_trie(trie: Trie, max_depth: int = 3) -> None:
     """Print a shallow visualization of the first few branches of the trie."""
     def _print(node: TrieNode, prefix: str, depth: int):
@@ -229,12 +229,12 @@ Commands:
   :quit                 - Save and exit.
 Notes:
   - To accept a suggestion, type its number (e.g. 1).
-  - Typing the full word will add it if not present (interactive learning).
+  - Typing the full word will add it if not present.
 """
 
 
 class CLI:
-    """Simple, friendly command-line loop for interacting with the autocomplete."""
+    """Command-line loop for interacting with the autocomplete."""
 
     def __init__(self, persistence: Persistence):
         self.persistence = persistence
