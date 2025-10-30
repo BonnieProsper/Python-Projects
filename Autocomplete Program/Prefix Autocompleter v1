@@ -1,0 +1,415 @@
+"""
+Smart Adaptive Autocomplete 
+
+Features:
+- Trie-based prefix index
+- Frequency counters + last-used timestamps
+- Persistent storage (JSON)
+- Interactive CLI with learning mode and small visualization
+- Simple, explainable scoring for ranking suggestions
+
+"""
+
+from __future__ import annotations
+import json
+import os
+import time
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+
+# ----- Config -----
+DATA_FILE = Path("autocomplete_data.json")
+DEFAULT_SUGGESTIONS = 8
+
+
+# ----- Trie node & storage model -----
+class TrieNode:
+    """A node in the Trie. Children stored in dict; end marker holds metadata."""
+    __slots__ = ("children", "is_word", "freq", "last_used")
+
+    def __init__(self):
+        self.children: Dict[str, TrieNode] = {}
+        self.is_word: bool = False
+        # Only meaningful when is_word == True:
+        self.freq: int = 0
+        self.last_used: float = 0.0  # UNIX timestamp
+
+
+# ----- Trie implementation -----
+class Trie:
+    """Classic Trie with insertion, deletion, and prefix traversal."""
+
+    def __init__(self):
+        self.root = TrieNode()
+
+    def insert(self, word: str, freq: int = 1, last_used: Optional[float] = None) -> None:
+        """Insert word into trie; set metadata if provided."""
+        node = self.root
+        for ch in word:
+            node = node.children.setdefault(ch, TrieNode())
+        node.is_word = True
+        node.freq = max(node.freq, 0) + freq
+        node.last_used = last_used if last_used is not None else time.time()
+
+    def set_metadata(self, word: str, freq: int, last_used: float) -> bool:
+        """Set exact metadata for an existing word; returns True if word exists."""
+        node = self._find_node(word)
+        if node and node.is_word:
+            node.freq = freq
+            node.last_used = last_used
+            return True
+        return False
+
+    def contains(self, word: str) -> bool:
+        node = self._find_node(word)
+        return bool(node and node.is_word)
+
+    def remove(self, word: str) -> bool:
+        """Remove a word completely; returns True if removed."""
+        path: List[Tuple[str, TrieNode]] = []
+        node = self.root
+        for ch in word:
+            if ch not in node.children:
+                return False
+            path.append((ch, node))
+            node = node.children[ch]
+        if not node.is_word:
+            return False
+        # clear word flag and metadata
+        node.is_word = False
+        node.freq = 0
+        node.last_used = 0.0
+        # prune nodes with no children and not words
+        for ch, parent in reversed(path):
+            child = parent.children[ch]
+            if child.children or child.is_word:
+                break
+            del parent.children[ch]
+        return True
+
+    def _find_node(self, prefix: str) -> Optional[TrieNode]:
+        node = self.root
+        for ch in prefix:
+            node = node.children.get(ch)
+            if node is None:
+                return None
+        return node
+
+    def iter_words_from(self, prefix: str) -> List[Tuple[str, TrieNode]]:
+        """Return list of (word, node) for all words under prefix (DFS)."""
+        start = self._find_node(prefix)
+        if not start:
+            return []
+        results: List[Tuple[str, TrieNode]] = []
+        stack: List[Tuple[str, TrieNode]] = [(prefix, start)]
+        while stack:
+            cur_word, cur_node = stack.pop()
+            if cur_node.is_word:
+                results.append((cur_word, cur_node))
+            for ch, child in cur_node.children.items():
+                stack.append((cur_word + ch, child))
+        return results
+
+    def words_count(self) -> int:
+        """Count total words in trie (expensive for large tries)."""
+        return len(self.iter_words_from(""))
+
+
+# ----- Autocomplete logic -----
+class Autocomplete:
+    """
+    Autocomplete engine that ranks suggestions by a simple score:
+      score = freq + recency_boost
+    recency_boost = max(0, (T / (now - last_used + 1)))
+    where T is a small constant (more recent => higher boost).
+    """
+
+    def __init__(self, trie: Trie):
+        self.trie = trie
+        self.recency_constant = 3600.0  # one hour; tuneable
+
+    def score(self, node: TrieNode) -> float:
+        """Compute a score for a node (explained in docstring)."""
+        now = time.time()
+        recency = 0.0
+        if node.last_used > 0:
+            elapsed = now - node.last_used
+            recency = max(0.0, self.recency_constant / (elapsed + 1.0))
+        return float(node.freq) + recency
+
+    def suggest(self, prefix: str, limit: int = DEFAULT_SUGGESTIONS) -> List[Tuple[str, float]]:
+        """Return up to `limit` suggestions as (word, score) sorted by score desc, then lexicographically."""
+        prefix = prefix.lower()
+        candidates = self.trie.iter_words_from(prefix)
+        scored = []
+        for word, node in candidates:
+            scored.append((word, self.score(node)))
+        if not scored:
+            return []
+        # sort by (-score, word) so highest score first, then alphabetically
+        scored.sort(key=lambda ws: (-ws[1], ws[0]))
+        return scored[:limit]
+
+    def accept(self, word: str, increment: int = 1) -> None:
+        """Mark a suggestion as used (increase frequency and update last_used)."""
+        node = self.trie._find_node(word)
+        if node and node.is_word:
+            node.freq += increment
+            node.last_used = time.time()
+        else:
+            self.trie.insert(word, freq=increment, last_used=time.time())
+
+
+# ----- Persistence (JSON) -----
+class Persistence:
+    """Save/load trie data into a compact JSON word list with metadata."""
+
+    def __init__(self, path: Path = DATA_FILE):
+        self.path = Path(path)
+
+    def save(self, trie: Trie) -> None:
+        """Serialize words as list of dicts: [{'word': w, 'freq': f, 'last_used': t}, ...]"""
+        words = []
+        for word, node in trie.iter_words_from(""):
+            words.append({"word": word, "freq": node.freq, "last_used": node.last_used})
+        # ensure directory exists
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("w", encoding="utf-8") as fh:
+            json.dump({"words": words, "generated_at": time.time()}, fh, ensure_ascii=False, indent=2)
+
+    def load(self) -> Trie:
+        trie = Trie()
+        if not self.path.exists():
+            return trie
+        try:
+            with self.path.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            for item in data.get("words", []):
+                w = item.get("word", "")
+                if not w:
+                    continue
+                freq = int(item.get("freq", 1))
+                last_used = float(item.get("last_used", 0.0))
+                trie.insert(w, freq=freq, last_used=last_used)
+        except Exception:
+            # If file corrupted, return empty trie (don’t crash the CLI)
+            return Trie()
+        return trie
+
+
+# ----- Small ASCII visualization (for debugging / portfolio demo) -----
+def visualize_trie(trie: Trie, max_depth: int = 3) -> None:
+    """Print a shallow visualization of the first few branches of the trie."""
+    def _print(node: TrieNode, prefix: str, depth: int):
+        if depth > max_depth:
+            return
+        children = sorted(node.children.items(), key=lambda kv: kv[0])
+        for ch, child in children:
+            marker = "*" if child.is_word else ""
+            info = f"{prefix + ch}{marker}"
+            print("  " * depth + info)
+            _print(child, prefix + ch, depth + 1)
+
+    print("Trie visualization (shallow):")
+    _print(trie.root, "", 0)
+    print("(end visualization)\n")
+
+
+# ----- CLI -----
+HELP_TEXT = """
+Commands:
+  :add <word>           - Add a word manually (or use when none suggestions).
+  :remove <word>        - Remove a word from the dataset.
+  :stats                - Show dataset statistics.
+  :export <path>        - Export word list (JSON).
+  :import <path>        - Import word list (JSON).
+  :visualize            - Print a shallow trie visualization.
+  :help                 - Show this help text.
+  :quit                 - Save and exit.
+Notes:
+  - To accept a suggestion, type its number (e.g. 1).
+  - Typing the full word will add it if not present (interactive learning).
+"""
+
+
+class CLI:
+    """Simple, friendly command-line loop for interacting with the autocomplete."""
+
+    def __init__(self, persistence: Persistence):
+        self.persistence = persistence
+        self.trie = self.persistence.load()
+        self.engine = Autocomplete(self.trie)
+
+    def run(self):
+        print("Adaptive Autocomplete — interactive demo")
+        print("Type a prefix and press Enter; use :help for commands.\n")
+        try:
+            while True:
+                prefix = input("prefix> ").strip()
+                if not prefix:
+                    continue
+                if prefix.startswith(":"):
+                    self._handle_command(prefix)
+                    continue
+                self._handle_prefix(prefix)
+        except (KeyboardInterrupt, EOFError):
+            print("\nExiting — saving data.")
+            self._save_and_exit()
+
+    def _handle_prefix(self, prefix: str) -> None:
+        prefix = prefix.lower()
+        suggestions = self.engine.suggest(prefix)
+        if suggestions:
+            self._present_suggestions(prefix, suggestions)
+            return
+        # no suggestions: offer to add interactively
+        print("No suggestions found.")
+        if self._ask_yes_no(f"Add '{prefix}' to dataset?"):
+            self.trie.insert(prefix, freq=1, last_used=time.time())
+            print(f"Added '{prefix}'.")
+            self.persistence.save(self.trie)
+
+    def _present_suggestions(self, prefix: str, suggestions: List[Tuple[str, float]]) -> None:
+        print("\nSuggestions:")
+        for i, (word, score) in enumerate(suggestions, start=1):
+            print(f"  {i}. {word}  (score: {score:.2f})")
+        print("  0. [type full word or new word to add]")
+        choice = input("Choose [number / word / nothing]: ").strip()
+        if not choice:
+            return
+        # numeric selection
+        if choice.isdigit():
+            idx = int(choice)
+            if idx == 0:
+                return
+            if 1 <= idx <= len(suggestions):
+                chosen = suggestions[idx - 1][0]
+                self.engine.accept(chosen)
+                print(f"Accepted suggestion: {chosen}")
+                self.persistence.save(self.trie)
+                return
+            print("Invalid number.")
+            return
+        # typed word: either select or add
+        typed = choice.lower()
+        if typed in (w for w, _ in suggestions):
+            # user typed an exact suggestion; accept it
+            self.engine.accept(typed)
+            print(f"Accepted suggestion: {typed}")
+            self.persistence.save(self.trie)
+            return
+        # otherwise add as new word with small freq
+        self.trie.insert(typed, freq=1, last_used=time.time())
+        print(f"Added new word: {typed}")
+        self.persistence.save(self.trie)
+
+    def _handle_command(self, line: str) -> None:
+        parts = line.split(maxsplit=1)
+        cmd = parts[0].lower()
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        if cmd == ":add":
+            if not arg:
+                print("Usage: :add <word>")
+            else:
+                w = arg.lower()
+                self.trie.insert(w, freq=1, last_used=time.time())
+                self.persistence.save(self.trie)
+                print(f"Added '{w}'")
+        elif cmd == ":remove":
+            if not arg:
+                print("Usage: :remove <word>")
+            else:
+                ok = self.trie.remove(arg.lower())
+                if ok:
+                    self.persistence.save(self.trie)
+                    print(f"Removed '{arg}'.")
+                else:
+                    print("Word not found.")
+        elif cmd == ":stats":
+            total = self.trie.words_count()
+            print(f"Words in dataset: {total}")
+            # top 10 words by freq
+            all_words = self.trie.iter_words_from("")
+            top = sorted(((w, n.freq) for w, n in all_words), key=lambda kv: -kv[1])[:10]
+            if top:
+                print("Top by frequency:")
+                for w, f in top:
+                    print(f"  {w} — {f}")
+        elif cmd == ":export":
+            path = arg or "autocomplete_export.json"
+            self._export(path)
+        elif cmd == ":import":
+            if not arg:
+                print("Usage: :import <path>")
+            else:
+                self._import(arg)
+        elif cmd == ":visualize":
+            visualize_trie(self.trie)
+        elif cmd == ":help":
+            print(HELP_TEXT)
+        elif cmd == ":quit":
+            self._save_and_exit()
+        else:
+            print("Unknown command. Use :help for available commands.")
+
+    def _export(self, path: str) -> None:
+        words = []
+        for w, node in self.trie.iter_words_from(""):
+            words.append({"word": w, "freq": node.freq, "last_used": node.last_used})
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"words": words, "exported_at": time.time()}, fh, ensure_ascii=False, indent=2)
+            print(f"Exported to {path}")
+        except Exception as e:
+            print("Export failed:", e)
+
+    def _import(self, path: str) -> None:
+        if not os.path.exists(path):
+            print("File not found:", path)
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            count = 0
+            for item in data.get("words", []):
+                w = item.get("word")
+                if not w:
+                    continue
+                f = int(item.get("freq", 1))
+                lu = float(item.get("last_used", 0.0))
+                # merge policy: add frequencies if word exists
+                node = self.trie._find_node(w)
+                if node and node.is_word:
+                    node.freq += f
+                    node.last_used = max(node.last_used, lu)
+                else:
+                    self.trie.insert(w, freq=f, last_used=lu)
+                count += 1
+            self.persistence.save(self.trie)
+            print(f"Imported {count} words from {path}")
+        except Exception as e:
+            print("Import failed:", e)
+
+    def _ask_yes_no(self, prompt: str) -> bool:
+        ans = input(f"{prompt} (y/n): ").strip().lower()
+        return ans.startswith("y")
+
+    def _save_and_exit(self) -> None:
+        try:
+            self.persistence.save(self.trie)
+            print("Saved.")
+        except Exception as e:
+            print("Failed to save:", e)
+        raise SystemExit(0)
+
+
+# ----- Entrypoint -----
+def main():
+    persistence = Persistence(DATA_FILE)
+    cli = CLI(persistence)
+    cli.run()
+
+
+if __name__ == "__main__":
+    main()
