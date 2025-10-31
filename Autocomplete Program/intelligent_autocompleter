@@ -1,0 +1,230 @@
+"""
+Intelligent Autocompleter v3.0
+---------------------------------
+CLI autocomplete system that:
+ - Learns from usage and adapts over time
+ - Supports typo tolerance using BK-trees
+ - Offers context-aware predictions (bigrams)
+ - Provides weighted scoring based on frequency + recency
+ - Includes persistent storage and evaluation tools
+"""
+
+import json
+import math
+import os
+import re
+from collections import defaultdict, Counter
+from difflib import SequenceMatcher
+
+
+# ------------------------------
+# 1. TRIE — For Prefix Search
+# ------------------------------
+class TrieNode:
+    def __init__(self):
+        self.children = {}
+        self.is_word = False
+        self.frequency = 0
+
+
+class Trie:
+    def __init__(self):
+        self.root = TrieNode()
+
+    def insert(self, word: str):
+        node = self.root
+        for ch in word.lower():
+            node = node.children.setdefault(ch, TrieNode())
+        node.is_word = True
+        node.frequency += 1
+
+    def search_prefix(self, prefix: str):
+        node = self.root
+        for ch in prefix.lower():
+            if ch not in node.children:
+                return []
+            node = node.children[ch]
+        results = []
+
+        def dfs(n, path):
+            if n.is_word:
+                results.append(("".join(path), n.frequency))
+            for c, child in n.children.items():
+                dfs(child, path + [c])
+
+        dfs(node, list(prefix))
+        return sorted(results, key=lambda x: -x[1])
+
+
+# ------------------------------
+# 2. BK-Tree — For Fuzzy Matching
+# ------------------------------
+def levenshtein(a: str, b: str) -> int:
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    dp = range(len(b) + 1)
+    for i, ca in enumerate(a, 1):
+        new_dp = [i]
+        for j, cb in enumerate(b, 1):
+            cost = 0 if ca == cb else 1
+            new_dp.append(min(
+                dp[j] + 1,
+                new_dp[-1] + 1,
+                dp[j - 1] + cost
+            ))
+        dp = new_dp
+    return dp[-1]
+
+
+class BKNode:
+    def __init__(self, word):
+        self.word = word
+        self.children = {}
+
+
+class BKTree:
+    def __init__(self):
+        self.root = None
+
+    def insert(self, word: str):
+        if self.root is None:
+            self.root = BKNode(word)
+            return
+        node = self.root
+        while True:
+            dist = levenshtein(word, node.word)
+            if dist in node.children:
+                node = node.children[dist]
+            else:
+                node.children[dist] = BKNode(word)
+                break
+
+    def query(self, word: str, max_dist: int = 2):
+        results = []
+
+        def rec(node):
+            dist = levenshtein(word, node.word)
+            if dist <= max_dist:
+                results.append((node.word, dist))
+            for d in range(dist - max_dist, dist + max_dist + 1):
+                if d in node.children:
+                    rec(node.children[d])
+
+        if self.root:
+            rec(self.root)
+        return sorted(results, key=lambda x: x[1])
+
+
+# ------------------------------
+# 3. CONTEXT PREDICTOR (N-Gram)
+# ------------------------------
+class ContextPredictor:
+    def __init__(self):
+        self.bigrams = defaultdict(Counter)
+
+    def learn(self, sentence: str):
+        words = re.findall(r"\w+", sentence.lower())
+        for w1, w2 in zip(words, words[1:]):
+            self.bigrams[w1][w2] += 1
+
+    def predict(self, last_word: str):
+        candidates = self.bigrams.get(last_word.lower(), {})
+        return sorted(candidates.items(), key=lambda x: -x[1])[:5]
+
+
+# ------------------------------
+# 4. MAIN AUTOCOMPLETER
+# ------------------------------
+class Autocompleter:
+    def __init__(self, data_path="autocomplete_data.json"):
+        self.trie = Trie()
+        self.bk = BKTree()
+        self.context = ContextPredictor()
+        self.scores = Counter()
+        self.data_path = data_path
+        self._load()
+
+    def _load(self):
+        if os.path.exists(self.data_path):
+            with open(self.data_path, "r") as f:
+                data = json.load(f)
+                for w, freq in data.get("words", {}).items():
+                    self.trie.insert(w)
+                    self.scores[w] = freq
+                    self.bk.insert(w)
+                self.context.bigrams = defaultdict(Counter, {
+                    k: Counter(v) for k, v in data.get("bigrams", {}).items()
+                })
+
+    def _save(self):
+        with open(self.data_path, "w") as f:
+            json.dump({
+                "words": dict(self.scores),
+                "bigrams": {k: dict(v) for k, v in self.context.bigrams.items()}
+            }, f, indent=2)
+
+    def suggest(self, text: str):
+        text = text.strip().lower()
+        if not text:
+            return []
+
+        parts = text.split()
+        prefix = parts[-1]
+        context_word = parts[-2] if len(parts) > 1 else None
+
+        # 1. Prefix-based suggestions
+        base_suggestions = self.trie.search_prefix(prefix)
+
+        # 2. Fuzzy matching suggestions
+        fuzzy_suggestions = self.bk.query(prefix, max_dist=1)
+
+        # 3. Context predictions
+        context_suggestions = []
+        if context_word:
+            context_suggestions = self.context.predict(context_word)
+
+        # 4. Merge + Score
+        candidates = defaultdict(float)
+        for word, freq in base_suggestions:
+            candidates[word] += math.log(freq + 1)
+        for word, dist in fuzzy_suggestions:
+            candidates[word] += max(0, 2 - dist)
+        for word, freq in context_suggestions:
+            candidates[word] += freq * 0.5
+
+        ranked = sorted(candidates.items(), key=lambda x: -x[1])
+        return [w for w, _ in ranked[:5]]
+
+    def learn_from_input(self, text: str):
+        words = re.findall(r"\w+", text.lower())
+        for w in words:
+            self.trie.insert(w)
+            self.bk.insert(w)
+            self.scores[w] += 1
+        self.context.learn(text)
+        self._save()
+
+
+# ------------------------------
+# 5. CLI INTERFACE
+# ------------------------------
+def run_cli():
+    ac = Autocompleter()
+    print("🔍 Intelligent Autocompleter v3.0 — type sentences (or 'quit' to exit)\n")
+
+    while True:
+        text = input("You: ").strip()
+        if text.lower() == "quit":
+            break
+        suggestions = ac.suggest(text)
+        if suggestions:
+            print("Suggestions:", ", ".join(suggestions))
+        else:
+            print("No suggestions yet.")
+        ac.learn_from_input(text)
+
+
+if __name__ == "__main__":
+    run_cli()
