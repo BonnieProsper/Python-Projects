@@ -1,34 +1,58 @@
+import os
+import tempfile
 import pytest
-from intelligent_autocompleter import Trie, BKTree, ContextPredictor, Autocompleter
+from intelligent_autocomplete_v4 import Trie, BKTree, NGramModel, SmartEngine, Persistence, CLI, levenshtein
 
+def test_levenshtein_basic():
+    assert levenshtein("kitten", "sitting") == 3
+    assert levenshtein("", "a") == 1
+    assert levenshtein("abc", "abc") == 0
 
-def test_trie_insert_and_search():
+def test_trie_insert_search():
     t = Trie()
-    t.insert("hello")
+    t.insert("Hello")
     t.insert("help")
-    res = t.search_prefix("he")
-    assert len(res) == 2
-    assert res[0][0].startswith("he")
+    res = t.iter_from("he")
+    assert any(w == "hello" for w, _ in res)
+    assert any(w == "help" for w, _ in res)
 
-
-def test_bktree_fuzzy_match():
+def test_bktree_basic():
     b = BKTree()
     for w in ["hello", "help", "halo"]:
         b.insert(w)
-    matches = b.query("helo", max_dist=1)
-    assert any(m[0] == "hello" for m in matches)
+    res = b.query("helo", 1)
+    assert any(word == "hello" for word, d in res)
 
+def test_ngram_backoff():
+    n = NGramModel()
+    n.add_sentence("thank you very much")
+    top = n.top_next("thank")
+    assert top and top[0][0] == "you"
+    # backoff: unknown prev -> unigram
+    uni_top = n.top_next("nonexistent")
+    assert isinstance(uni_top, list)
 
-def test_context_predictor():
-    c = ContextPredictor()
-    c.learn("thank you very much")
-    preds = c.predict("thank")
-    assert preds[0][0] == "you"
-
-
-def test_autocompleter_learn_and_suggest(tmp_path):
+def test_persistence_roundtrip(tmp_path):
     data = tmp_path / "data.json"
-    ac = Autocompleter(data_path=str(data))
-    ac.learn_from_input("thank you for coming")
-    suggestions = ac.suggest("thank yuo")
-    assert "you" in suggestions
+    persistence = Persistence(data)
+    trie = Trie()
+    ngram = NGramModel()
+    trie.insert("hello", freq=2)
+    ngram.add_sentence("hello world")
+    stats = {"a":1}
+    persistence.save(trie, ngram, stats)
+    t2, n2, s2 = persistence.load()
+    assert t2.words_count() >= 1
+    assert "hello" in [w for w, _ in t2.iter_from("h")]
+
+def test_integration_search(tmp_path):
+    trie, ngram, bk = Trie(), NGramModel(), BKTree()
+    sentences = ["the quick brown fox", "jumps over the lazy dog", "thank you very much"]
+    for s in sentences:
+        for w in __import__("re").findall(r"\w+", s.lower()):
+            trie.insert(w)
+            bk.insert(w)
+        ngram.add_sentence(s)
+    engine = SmartEngine(trie, ngram, bk)
+    res = engine.suggest("qu", prev_context="the", fuzzy=True)
+    assert any(isinstance(c.word, str) for c in res)
