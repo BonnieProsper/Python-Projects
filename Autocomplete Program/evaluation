@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""
+Evaluation harness: compares fuzzy vs exact-prefix suggestion accuracy.
+Usage:
+    python evaluation.py demo_corpus.txt
+"""
+
+import sys
+import time
+import json
+from pathlib import Path
+from intelligent_autocomplete_v4 import CLI, SmartEngine, Trie, NGramModel, BKTree, Persistence, DATA_FILE
+
+def load_corpus(path):
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            s = line.strip()
+            if s:
+                yield s
+
+def build_model_from_corpus(corpus):
+    trie = Trie()
+    ngram = NGramModel()
+    bk = BKTree()
+    for s in corpus:
+        words = __import__("re").findall(r"\w+", s.lower())
+        for w in words:
+            trie.insert(w, freq=1)
+            bk.insert(w)
+        ngram.add_sentence(s)
+    return trie, ngram, bk
+
+def evaluate(corpus_path, top_k=5):
+    corpus = list(load_corpus(corpus_path))
+    # train on all except last 20% (simple train/test split)
+    split = int(len(corpus) * 0.8) or len(corpus)-1
+    train = corpus[:split]
+    test = corpus[split:]
+    trie, ngram, bk = build_model_from_corpus(train)
+    engine = SmartEngine(trie, ngram, bk)
+
+    def score(fuzzy_flag):
+        hits = 0
+        total = 0
+        t0 = time.time()
+        for s in test:
+            tokens = __import__("re").findall(r"\w+", s.lower())
+            for i in range(len(tokens)-1):
+                prefix = tokens[i+1][:max(1, len(tokens[i+1])//2)]  # partial next-word prefix
+                true_next = tokens[i+1]
+                prev = tokens[i]
+                cand = engine.suggest(prefix, prev_context=prev, fuzzy=fuzzy_flag, limit=top_k)
+                total += 1
+                if any(c.word == true_next for c in cand):
+                    hits += 1
+        t1 = time.time()
+        return hits, total, t1 - t0
+
+    print("Running evaluation...")
+    fuzzy_hits, total, fuzzy_time = score(True)
+    exact_hits, _, exact_time = score(False)
+
+    print(f"Fuzzy: {fuzzy_hits}/{total} ({100*fuzzy_hits/total:.2f}%), time {fuzzy_time:.2f}s")
+    print(f"Exact: {exact_hits}/{total} ({100*exact_hits/total:.2f}%), time {exact_time:.2f}s")
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python evaluation.py path/to/corpus.txt")
+        sys.exit(1)
+    evaluate(sys.argv[1])
